@@ -3,3 +3,6 @@
 ################################################################################
 
 /.vs/VSWorkspaceState.json
+/.vs/LLD/FileContentIndex
+/.vs/LLD/v17/.wsuo
+*.sqlite
