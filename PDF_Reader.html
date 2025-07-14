@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Kindle</title>
+    <style>
+        body { font-family: sans-serif; display: flex; height: 100vh; margin: 0; }
+        #sidebar { width: 250px; border-right: 1px solid #ccc; padding: 1rem; overflow-y: auto; }
+        #viewer { flex-grow: 1; position: relative; }
+        #upload-btn { display: block; width: 100%; padding: 0.5rem; margin-bottom: 1rem; }
+        #book-list { list-style: none; padding: 0; }
+        #book-list li { padding: 0.5rem; cursor: pointer; border-bottom: 1px solid #eee; }
+        #book-list li.active { background-color: #eee; }
+        #pdf-viewer, #epub-viewer { width: 100%; height: 100%; }
+        #pdf-viewer { overflow: auto; }
+        #prev, #next { position: absolute; top: 50%; transform: translateY(-50%); padding: 1rem; background: rgba(0,0,0,0.2); color: white; cursor: pointer; user-select: none; }
+        #prev { left: 0; }
+        #next { right: 0; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.11.338/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.5.0/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.93/epub.min.js"></script>
+</head>
+<body>
+
+<div id="sidebar">
+    <input type="file" id="upload-btn" accept=".pdf,.epub">
+    <h2>My Library</h2>
+    <ul id="book-list"></ul>
+</div>
+
+<div id="viewer">
+    <div id="pdf-viewer"></div>
+    <div id="epub-viewer"></div>
+    <div id="prev" style="display: none;">&lt;</div>
+    <div id="next" style="display: none;">&gt;</div>
+</div>
+
+<script>
+    const uploadBtn = document.getElementById('upload-btn');
+    const bookList = document.getElementById('book-list');
+    const pdfViewer = document.getElementById('pdf-viewer');
+    const epubViewer = document.getElementById('epub-viewer');
+    const prevBtn = document.getElementById('prev');
+    const nextBtn = document.getElementById('next');
+
+    let db;
+    let currentBook = null;
+    let currentRendition = null;
+    let currentPdfDoc = null;
+
+    // Initialize IndexedDB
+    const request = indexedDB.open('kindleAppDB', 1);
+
+    request.onupgradeneeded = function(event) {
+        const db = event.target.result;
+        const bookStore = db.createObjectStore('books', { keyPath: 'name' });
+        bookStore.createIndex('file', 'file', { unique: false });
+        const progressStore = db.createObjectStore('progress', { keyPath: 'bookName' });
+    };
+
+    request.onsuccess = function(event) {
+        db = event.target.result;
+        loadBookList();
+    };
+
+    request.onerror = function(event) {
+        console.error('IndexedDB error:', event.target.errorCode);
+    };
+
+    // Handle file upload
+    uploadBtn.onchange = function(event) {
+        const file = event.target.files[0];
+        if (file) {
+            const transaction = db.transaction(['books'], 'readwrite');
+            const store = transaction.objectStore('books');
+            const book = { name: file.name, file: file };
+            const request = store.add(book);
+            request.onsuccess = function() {
+                loadBookList();
+            };
+        }
+    };
+
+    // Load and display the list of uploaded books
+    function loadBookList() {
+        bookList.innerHTML = '';
+        const transaction = db.transaction(['books'], 'readonly');
+        const store = transaction.objectStore('books');
+        const request = store.openCursor();
+
+        request.onsuccess = function(event) {
+            const cursor = event.target.result;
+            if (cursor) {
+                const li = document.createElement('li');
+                li.textContent = cursor.value.name;
+                li.onclick = () => openBook(cursor.value.name);
+                bookList.appendChild(li);
+                cursor.continue();
+            }
+        };
+    }
+
+    // Open a selected book
+    function openBook(bookName) {
+        const transaction = db.transaction(['books'], 'readonly');
+        const store = transaction.objectStore('books');
+        const request = store.get(bookName);
+
+        request.onsuccess = function(event) {
+            const book = event.target.result;
+            currentBook = book;
+            resetViewers();
+            setActiveBook(bookName);
+
+            if (book.file.type === 'application/pdf') {
+                renderPdf(book.file);
+            } else if (book.file.type === 'application/epub+zip') {
+                renderEpub(book.file);
+            }
+        };
+    }
+
+    // Highlight the currently active book
+    function setActiveBook(bookName) {
+        const items = bookList.getElementsByTagName('li');
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].textContent === bookName) {
+                items[i].classList.add('active');
+            } else {
+                items[i].classList.remove('active');
+            }
+        }
+    }
+
+    // Clear the viewer areas
+    function resetViewers() {
+        pdfViewer.innerHTML = '';
+        epubViewer.innerHTML = '';
+        prevBtn.style.display = 'none';
+        nextBtn.style.display = 'none';
+        currentRendition = null;
+        currentPdfDoc = null;
+    }
+
+    // Render a PDF file
+    async function renderPdf(file) {
+        pdf.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.11.338/pdf.worker.min.js`;
+        const fileReader = new FileReader();
+        fileReader.onload = async function() {
+            const typedarray = new Uint8Array(this.result);
+            const pdfDoc = await pdf.getDocument(typedarray).promise;
+            currentPdfDoc = pdfDoc;
+            const progress = await getProgress(currentBook.name);
+            const pageNum = progress ? progress.location : 1;
+            renderPdfPage(pageNum);
+        };
+        fileReader.readAsArrayBuffer(file);
+    }
+
+    async function renderPdfPage(num) {
+        const page = await currentPdfDoc.getPage(num);
+        const viewport = page.getViewport({ scale: 1.5 });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        pdfViewer.innerHTML = '';
+        pdfViewer.appendChild(canvas);
+        page.render({ canvasContext: context, viewport: viewport });
+        saveProgress(currentBook.name, num);
+        
+        prevBtn.style.display = num > 1 ? 'block' : 'none';
+        nextBtn.style.display = num < currentPdfDoc.numPages ? 'block' : 'none';
+
+        prevBtn.onclick = () => renderPdfPage(num - 1);
+        nextBtn.onclick = () => renderPdfPage(num + 1);
+    }
+
+
+    // Render an EPUB file
+    function renderEpub(file) {
+        const fileReader = new FileReader();
+        fileReader.onload = async function() {
+            const book = ePub(this.result);
+            currentRendition = book.renderTo(epubViewer, { width: '100%', height: '100%' });
+            const progress = await getProgress(currentBook.name);
+            currentRendition.display(progress ? progress.location : undefined);
+
+            currentRendition.on('relocated', function(location){
+                saveProgress(currentBook.name, location.start.cfi);
+            });
+
+            prevBtn.onclick = () => currentRendition.prev();
+            nextBtn.onclick = () => currentRendition.next();
+            prevBtn.style.display = 'block';
+            nextBtn.style.display = 'block';
+        };
+        fileReader.readAsArrayBuffer(file);
+    }
+
+    // Save reading progress
+    function saveProgress(bookName, location) {
+        const transaction = db.transaction(['progress'], 'readwrite');
+        const store = transaction.objectStore('progress');
+        store.put({ bookName: bookName, location: location });
+    }
+
+    // Get reading progress
+    function getProgress(bookName) {
+        return new Promise((resolve) => {
+            const transaction = db.transaction(['progress'], 'readonly');
+            const store = transaction.objectStore('progress');
+            const request = store.get(bookName);
+            request.onsuccess = function(event) {
+                resolve(event.target.result);
+            };
+            request.onerror = () => resolve(null);
+        });
+    }
+
+</script>
+
+</body>
+</html>
