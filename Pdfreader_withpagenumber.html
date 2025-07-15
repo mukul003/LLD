@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Reader</title>
+    <style>
+        :root {
+            --primary-color: #007aff;
+            --sidebar-bg: #f7f7f7;
+            --viewer-bg: #e9e9e9;
+            --text-color: #333;
+        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif; display: flex; height: 100vh; margin: 0; }
+        #sidebar { width: 250px; border-right: 1px solid #ccc; padding: 1rem; overflow-y: auto; background-color: var(--sidebar-bg); }
+        #viewer { flex-grow: 1; position: relative; background-color: var(--viewer-bg); display: flex; flex-direction: column; }
+        #content-area { flex-grow: 1; overflow-y: auto; position: relative; }
+        #upload-btn { display: block; width: 100%; padding: 0.75rem; margin-bottom: 1rem; background-color: var(--primary-color); color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 1rem; }
+        #upload-btn:hover { background-color: #0056b3; }
+        h2 { border-bottom: 2px solid #ddd; padding-bottom: 0.5rem; color: var(--text-color); }
+        #book-list { list-style: none; padding: 0; margin: 0; }
+        #book-list li { padding: 0.75rem; cursor: pointer; border-bottom: 1px solid #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        #book-list li:hover { background-color: #e0e0e0; }
+        #book-list li.active { background-color: var(--primary-color); color: white; font-weight: bold; }
+        #pdf-viewer, #epub-viewer { width: 100%; height: 100%; }
+        #prev, #next { position: fixed; top: 50%; transform: translateY(-50%); padding: 1rem; background: rgba(0,0,0,0.2); color: white; cursor: pointer; user-select: none; border: none; font-size: 1.5rem; z-index: 100; }
+        #prev { left: 260px; border-radius: 0 50% 50% 0; }
+        #next { right: 10px; border-radius: 50% 0 0 50%; }
+        #progress-indicator { background-color: rgba(0, 0, 0, 0.7); color: white; text-align: center; padding: 5px 0; font-size: 0.9rem; user-select: none; }
+        .page-container { position: relative; margin: 1rem auto; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
+        .textLayer { position: absolute; left: 0; top: 0; right: 0; bottom: 0; opacity: 0.5; line-height: 1.0; }
+        .textLayer > span { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; }
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.178/pdf.min.mjs" type="module" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.98/epub.min.js" defer></script>
+</head>
+<body>
+
+<div id="sidebar">
+    <input type="file" id="upload-input" accept=".pdf,.epub" style="display: none;">
+    <button id="upload-btn">📚 Upload Book</button>
+    <h2>My Library</h2>
+    <ul id="book-list"></ul>
+</div>
+
+<div id="viewer">
+    <div id="content-area">
+        <div id="pdf-viewer"></div>
+        <div id="epub-viewer"></div>
+    </div>
+    <div id="progress-indicator">No book open</div>
+    <a id="prev" style="display: none;">&lt;</a>
+    <a id="next" style="display: none;">&gt;</a>
+</div>
+
+<script type="module">
+    document.addEventListener("DOMContentLoaded", () => {
+        const uploadInput = document.getElementById('upload-input');
+        const uploadBtn = document.getElementById('upload-btn');
+        const bookList = document.getElementById('book-list');
+        const contentArea = document.getElementById('content-area');
+        const pdfViewer = document.getElementById('pdf-viewer');
+        const epubViewer = document.getElementById('epub-viewer');
+        const prevBtn = document.getElementById('prev');
+        const nextBtn = document.getElementById('next');
+        const progressIndicator = document.getElementById('progress-indicator');
+
+        let db;
+        let currentBook = null;
+        let currentRendition = null;
+        let currentPdfDoc = null;
+        const { pdfjsLib: pdf } = globalThis;
+        
+        // **IMPORTANT**: Worker path updated to Cloudflare
+        pdf.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.178/pdf.worker.min.mjs`;
+
+        uploadBtn.onclick = () => uploadInput.click();
+        const request = indexedDB.open('kindleAppDB_v3', 3);
+
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains('books')) db.createObjectStore('books', { keyPath: 'name' });
+            if (!db.objectStoreNames.contains('progress')) db.createObjectStore('progress', { keyPath: 'bookName' });
+        };
+        request.onsuccess = (event) => { db = event.target.result; loadBookList(); };
+        request.onerror = (event) => console.error('IndexedDB error:', event.target.errorCode);
+        uploadInput.onchange = (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            const transaction = db.transaction(['books'], 'readwrite');
+            const addRequest = transaction.objectStore('books').add({ name: file.name, file: file });
+            addRequest.onsuccess = () => loadBookList();
+            addRequest.onerror = (e) => {
+                if (e.target.error.name === 'ConstraintError') alert('A book with this name already exists.');
+            };
+        };
+
+        function loadBookList() {
+            bookList.innerHTML = '';
+            const store = db.transaction('books').objectStore('books');
+            store.openCursor().onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    const li = document.createElement('li');
+                    li.textContent = li.title = cursor.value.name;
+                    li.onclick = () => openBook(cursor.value.name);
+                    bookList.appendChild(li);
+                    cursor.continue();
+                }
+            };
+        }
+
+        function openBook(bookName) {
+            db.transaction('books').objectStore('books').get(bookName).onsuccess = (event) => {
+                currentBook = event.target.result;
+                resetViewers();
+                setActiveBook(bookName);
+                if (bookName.toLowerCase().endsWith('.pdf')) renderPdf(currentBook.file);
+                else if (bookName.toLowerCase().endsWith('.epub')) renderEpub(currentBook.file);
+            };
+        }
+
+        function setActiveBook(bookName) {
+            bookList.querySelectorAll('li').forEach(item => item.classList.toggle('active', item.textContent === bookName));
+        }
+
+        function resetViewers() {
+            pdfViewer.innerHTML = epubViewer.innerHTML = '';
+            prevBtn.style.display = nextBtn.style.display = 'none';
+            progressIndicator.textContent = 'No book open';
+            currentRendition = currentPdfDoc = null;
+        }
+
+        function updateProgress(current, total, isEpub = false) {
+            if (total > 0) {
+                const percentage = ((isEpub ? current + 1 : current) / total * 100).toFixed(1);
+                const prefix = isEpub ? "Section" : "Page";
+                progressIndicator.textContent = `${prefix}: ${current + (isEpub ? 1 : 0)}/${total} (${percentage}%)`;
+            }
+        }
+
+        async function renderPdfPage(num) {
+            const page = await currentPdfDoc.getPage(num);
+            const viewport = page.getViewport({ scale: 1.5 });
+
+            const pageContainer = document.createElement('div');
+            pageContainer.className = 'page-container';
+            pageContainer.style.width = `${viewport.width}px`;
+            pageContainer.style.height = `${viewport.height}px`;
+
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            pageContainer.appendChild(canvas);
+            
+            const textLayerDiv = document.createElement('div');
+            textLayerDiv.className = 'textLayer';
+            pageContainer.appendChild(textLayerDiv);
+            
+            pdfViewer.innerHTML = '';
+            pdfViewer.appendChild(pageContainer);
+            contentArea.scrollTop = 0;
+
+            await page.render({ canvasContext: context, viewport }).promise;
+            
+            const textContent = await page.getTextContent();
+            await pdfjsLib.renderTextLayer({
+                textContentSource: textContent,
+                container: textLayerDiv,
+                viewport: viewport,
+                textDivs: []
+            }).promise;
+            
+            saveProgress(currentBook.name, num);
+            updateProgress(num, currentPdfDoc.numPages);
+            
+            prevBtn.style.display = num > 1 ? 'block' : 'none';
+            nextBtn.style.display = num < currentPdfDoc.numPages ? 'block' : 'none';
+            prevBtn.onclick = () => renderPdfPage(num - 1);
+            nextBtn.onclick = () => renderPdfPage(num + 1);
+        }
+
+        async function renderPdf(file) {
+            try {
+                const data = await file.arrayBuffer();
+                const pdfDoc = await pdf.getDocument({ data }).promise;
+                currentPdfDoc = pdfDoc;
+                const progress = await getProgress(currentBook.name);
+                renderPdfPage(progress?.location || 1);
+            } catch (error) {
+                console.error("Error loading PDF:", error);
+                alert("Could not load PDF file.");
+            }
+        }
+        
+        async function renderEpub(file) {
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const book = ePub(arrayBuffer);
+                currentRendition = book.renderTo(epubViewer, { width: '100%', height: '100%' });
+                const progress = await getProgress(currentBook.name);
+                await currentRendition.display(progress?.location);
+
+                book.ready.then(() => {
+                    const locations = book.locations;
+                    currentRendition.on('relocated', (location) => {
+                        const totalSections = book.spine.items.length;
+                        const currentSection = location.start.index;
+                        updateProgress(currentSection, totalSections, true);
+                        saveProgress(currentBook.name, location.start.cfi);
+                    });
+                });
+                
+                prevBtn.onclick = () => currentRendition.prev();
+                nextBtn.onclick = () => currentRendition.next();
+                prevBtn.style.display = 'block';
+                nextBtn.style.display = 'block';
+            } catch (error) {
+                console.error("Error loading EPUB:", error);
+                alert("Could not load EPUB file.");
+            }
+        }
+
+        function saveProgress(bookName, location) {
+            const store = db.transaction('progress', 'readwrite').objectStore('progress');
+            store.put({ bookName, location });
+        }
+
+        function getProgress(bookName) {
+            return new Promise((resolve) => {
+                const request = db.transaction('progress').objectStore('progress').get(bookName);
+                request.onsuccess = (event) => resolve(event.target.result);
+                request.onerror = () => resolve(null);
+            });
+        }
+    });
+</script>
+
+</body>
+</html>
